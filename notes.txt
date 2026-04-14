@@ -479,3 +479,45 @@ public class GoogleAuthFilter implements ContainerRequestFilter {
         return null;
     }
 }
+
+
+
+
++++++++++++++
+
+
+package com.enterprise.dataagent.auth;
+
+import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.container.ContainerRequestFilter;
+import jakarta.ws.rs.ext.Provider;
+import org.jboss.logging.Logger;
+
+/**
+ * Extracts the Google token forwarded by the routing agent.
+ *
+ * The routing agent validates the token and forwards it as:
+ *   X-Forwarded-Authorization: Bearer <token>
+ *
+ * This filter extracts it and stashes it in the request context
+ * so tools (BigQuery, GCS, etc.) can use it for user-scoped access.
+ */
+@Provider
+public class ForwardedTokenFilter implements ContainerRequestFilter {
+
+    private static final Logger LOG = Logger.getLogger(ForwardedTokenFilter.class);
+    public static final String TOKEN_PROPERTY = "gcp.forwarded.token";
+
+    @Override
+    public void filter(ContainerRequestContext ctx) {
+        String header = ctx.getHeaderString("X-Forwarded-Authorization");
+        if (header != null && header.length() > 7
+                && header.substring(0, 7).equalsIgnoreCase("Bearer ")) {
+            String token = header.substring(7).trim();
+            if (!token.isEmpty()) {
+                ctx.setProperty(TOKEN_PROPERTY, token);
+                LOG.debugf("Forwarded token extracted (%d chars)", token.length());
+            }
+        }
+    }
+}
