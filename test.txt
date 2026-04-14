@@ -16,6 +16,11 @@ curl -s http://localhost:9000/.well-known/agent-card.json | jq .
 # ─────────────────────────────────────────────────
 # 3. Send a message (non-streaming, message/send)
 #    Should return a single JSON-RPC response
+
+curl -s -X POST http://localhost:8082 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer test-token-123" \
+  -d '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","parts":[{"kind":"text","text":"hi"}],"messageId":"m1"}}}' | jq .
 # ─────────────────────────────────────────────────
 
 curl -s -X POST http://localhost:8080 \
