@@ -1,0 +1,231 @@
+package com.enterprise.router.executor;
+
+import io.a2a.client.Client;
+import io.a2a.client.ClientEvent;
+import io.a2a.client.MessageEvent;
+import io.a2a.client.TaskEvent;
+import io.a2a.client.TaskUpdateEvent;
+import io.a2a.server.agentexecution.AgentExecutor;
+import io.a2a.server.agentexecution.RequestContext;
+import io.a2a.server.tasks.AgentEmitter;
+import io.a2a.spec.A2A;
+import io.a2a.spec.AgentCard;
+import io.a2a.spec.Message;
+import io.a2a.spec.Part;
+import io.a2a.spec.TextPart;
+import io.a2a.spec.Task;
+import io.a2a.spec.TaskState;
+import org.jboss.logging.Logger;
+
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+
+/**
+ * Routing executor — implements {@link AgentExecutor} to forward
+ * requests to the data-agent via the A2A SDK Client.
+ *
+ * The SDK reference server calls {@code execute()} for each inbound
+ * JSON-RPC request. This executor:
+ *   1. Marks the task as submitted + working
+ *   2. Extracts user text from the request context
+ *   3. Forwards to the data-agent via A2A SDK Client
+ *   4. Relays events back through the AgentEmitter
+ *   5. Marks complete or failed
+ *
+ * Error handling — all errors go through AgentEmitter:
+ *   - Bad input → updateStatus(FAILED, error message)
+ *   - Data-agent unreachable → updateStatus(FAILED, error message)
+ *   - Streaming error → updateStatus(FAILED, error message)
+ *   - Timeout → updateStatus(FAILED, error message)
+ *
+ * Threading: execute() blocks until the data-agent finishes or
+ * times out. The SDK calls execute() on its worker threads.
+ * Configure concurrency via:
+ *   quarkus.thread-pool.max-threads=200
+ */
+public class RoutingExecutor implements AgentExecutor {
+
+    private static final Logger LOG = Logger.getLogger(RoutingExecutor.class);
+    private static final long TIMEOUT_SECONDS = 300;
+
+    private final Client a2aClient;
+
+    public RoutingExecutor(Client a2aClient) {
+        this.a2aClient = a2aClient;
+        LOG.info("RoutingExecutor initialized");
+    }
+
+    @Override
+    public void execute(RequestContext context, AgentEmitter emitter) throws Exception {
+        // ── Mark task lifecycle ──────────────────────────────────
+        if (context.getTask() == null) {
+            emitter.submit();
+        }
+        emitter.startWork();
+
+        // ── Extract user text ────────────────────────────────────
+        String userText = extractTextFromMessage(context.getMessage());
+        if (userText == null || userText.isBlank()) {
+            LOG.warn("No text content in request message");
+            emitter.updateStatus(TaskState.FAILED,
+                agentMessage("Invalid request: no text content in message."));
+            return;
+        }
+
+        LOG.debugf("Forwarding to data-agent: %d chars", userText.length());
+
+        // ── Forward to data-agent and block until done ───────────
+        // CompletableFuture acts as a latch — the final event
+        // callback completes it, and execute() returns.
+        CompletableFuture<Void> done = new CompletableFuture<>();
+
+        List<BiConsumer<ClientEvent, AgentCard>> consumers = List.of(
+            (event, card) -> relayEvent(event, emitter, done)
+        );
+
+        Consumer<Throwable> errorHandler = error -> {
+            LOG.errorf(error, "Streaming error from data-agent");
+            try {
+                emitter.updateStatus(TaskState.FAILED,
+                    agentMessage("Data agent encountered an error. Please try again."));
+            } catch (Exception e) {
+                LOG.errorf(e, "Failed to emit FAILED status");
+            }
+            done.complete(null);
+        };
+
+        try {
+            Message message = A2A.toUserMessage(userText);
+            a2aClient.sendMessage(message, consumers, errorHandler);
+        } catch (Exception e) {
+            LOG.errorf(e, "Failed to send message to data-agent");
+            emitter.updateStatus(TaskState.FAILED,
+                agentMessage("Unable to reach the data agent. Please try again later."));
+            return;
+        }
+
+        // Block until the final event arrives or we timeout
+        try {
+            done.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            LOG.warn("Timed out waiting for data-agent response");
+            emitter.updateStatus(TaskState.FAILED,
+                agentMessage("Request timed out. The data agent did not respond in time."));
+        } catch (Exception e) {
+            LOG.errorf(e, "Unexpected error waiting for data-agent");
+            emitter.updateStatus(TaskState.FAILED,
+                agentMessage("An unexpected error occurred. Please try again."));
+        }
+    }
+
+    @Override
+    public void cancel(RequestContext context, AgentEmitter emitter) throws Exception {
+        // TODO: Forward cancellation to data-agent if supported.
+        emitter.updateStatus(TaskState.FAILED,
+            agentMessage("Cancellation is not supported at this time."));
+    }
+
+    // ── Event Relay ─────────────────────────────────────────────
+
+    /**
+     * Relays a typed A2A SDK ClientEvent through the AgentEmitter.
+     *
+     * The AgentEmitter handles task state transitions and SSE
+     * serialization — we push content through it.
+     */
+    private void relayEvent(
+            ClientEvent event,
+            AgentEmitter emitter,
+            CompletableFuture<Void> done) {
+
+        try {
+            if (event instanceof MessageEvent messageEvent) {
+                String text = extractTextFromMessage(messageEvent.getMessage());
+                if (text != null) {
+                    emitter.updateStatus(TaskState.WORKING, agentMessage(text));
+                }
+
+            } else if (event instanceof TaskEvent taskEvent) {
+                Task task = taskEvent.getTask();
+                String text = extractTextFromTask(task);
+                boolean isFinal = task.status() != null
+                    && task.status().state() == TaskState.COMPLETED;
+
+                if (text != null) {
+                    List<Part<?>> parts = List.of(new TextPart(text));
+                    emitter.addArtifact(parts);
+                }
+
+                if (isFinal) {
+                    emitter.complete();
+                    done.complete(null);
+                }
+
+            } else if (event instanceof TaskUpdateEvent updateEvent) {
+                Task task = updateEvent.getTask();
+                boolean isFinal = updateEvent.isFinal();
+
+                // Relay status message text
+                String statusText = null;
+                if (task.status() != null && task.status().message() != null) {
+                    statusText = extractTextFromMessage(task.status().message());
+                }
+
+                if (statusText != null) {
+                    emitter.updateStatus(
+                        isFinal ? TaskState.COMPLETED : TaskState.WORKING,
+                        agentMessage(statusText));
+                }
+
+                // Relay artifacts if present
+                if (task.artifacts() != null) {
+                    for (var artifact : task.artifacts()) {
+                        if (artifact.parts() != null && !artifact.parts().isEmpty()) {
+                            emitter.addArtifact(artifact.parts());
+                        }
+                    }
+                }
+
+                if (isFinal) {
+                    emitter.complete();
+                    done.complete(null);
+                }
+            }
+        } catch (Exception e) {
+            LOG.errorf(e, "Error relaying event");
+            done.complete(null);
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────
+
+    private String extractTextFromMessage(Message message) {
+        if (message == null || message.parts() == null) return null;
+        return message.parts().stream()
+            .filter(p -> p instanceof TextPart)
+            .map(p -> ((TextPart) p).text())
+            .findFirst()
+            .orElse(null);
+    }
+
+    private String extractTextFromTask(Task task) {
+        if (task == null || task.artifacts() == null) return null;
+        return task.artifacts().stream()
+            .flatMap(a -> a.parts() != null ? a.parts().stream() : java.util.stream.Stream.empty())
+            .filter(p -> p instanceof TextPart)
+            .map(p -> ((TextPart) p).text())
+            .findFirst()
+            .orElse(null);
+    }
+
+    private Message agentMessage(String text) {
+        return new Message.Builder()
+            .role(Message.Role.AGENT)
+            .parts(List.of(new TextPart(text)))
+            .build();
+    }
+}
