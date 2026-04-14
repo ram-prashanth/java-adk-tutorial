@@ -1,5 +1,79 @@
 package com.enterprise.router.executor;
 
+import com.enterprise.router.config.RouterConfig;
+import io.a2a.client.A2ACardResolver;
+import io.a2a.client.Client;
+import io.a2a.client.ClientConfig;
+import io.a2a.client.http.JdkA2AHttpClient;
+import io.a2a.client.transport.JSONRPCTransport;
+import io.a2a.client.transport.JSONRPCTransportConfig;
+import io.a2a.server.agentexecution.AgentExecutor;
+import io.a2a.spec.AgentCard;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Produces;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.util.List;
+
+/**
+ * CDI producer that wires the routing agent's AgentExecutor.
+ *
+ * Builds the A2A SDK Client for the data-agent at startup, then
+ * produces a {@link RoutingExecutor} that the SDK reference server
+ * will call for each inbound request.
+ *
+ * The SDK reference server auto-discovers this bean and handles:
+ *   - POST / endpoint (JSON-RPC + SSE)
+ *   - Task lifecycle
+ *   - Error formatting
+ *   - Streaming
+ *
+ * All we produce is the executor that does the forwarding work.
+ */
+@ApplicationScoped
+public class RoutingExecutorProducer {
+
+    private static final Logger LOG = Logger.getLogger(RoutingExecutorProducer.class);
+
+    @Inject
+    RouterConfig config;
+
+    @Produces
+    public AgentExecutor agentExecutor() {
+        String baseUrl = config.dataAgent().baseUrl();
+        String cardUrl = baseUrl + config.dataAgent().agentCardPath();
+
+        LOG.infof("Building A2A Client for data-agent: %s", baseUrl);
+
+        AgentCard dataAgentCard = new A2ACardResolver(
+            new JdkA2AHttpClient(),
+            baseUrl,
+            cardUrl
+        ).getAgentCard();
+
+        boolean supportsStreaming = dataAgentCard.capabilities() != null
+            && dataAgentCard.capabilities().streaming();
+
+        Client a2aClient = Client.builder(dataAgentCard)
+            .withTransport(JSONRPCTransport.class, new JSONRPCTransportConfig())
+            .clientConfig(
+                new ClientConfig.Builder()
+                    .setStreaming(supportsStreaming)
+                    .setAcceptedOutputModes(List.of("text"))
+                    .build()
+            )
+            .build();
+
+        LOG.infof("A2A Client ready: agent=%s, streaming=%s",
+            dataAgentCard.name(), supportsStreaming);
+
+        return new RoutingExecutor(a2aClient);
+    }
+}
+++++++++++++++
+package com.enterprise.router.executor;
+
 import io.a2a.client.Client;
 import io.a2a.client.ClientEvent;
 import io.a2a.client.MessageEvent;
