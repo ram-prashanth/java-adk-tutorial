@@ -1,0 +1,161 @@
+# ─────────────────────────────────────────────────
+# 1. Verify agent card discovery
+#    Should show data-agent's skills with routing-agent's URL
+# ─────────────────────────────────────────────────
+
+curl -s http://localhost:8080/.well-known/agent-card.json | jq .
+
+
+# ─────────────────────────────────────────────────
+# 2. Verify data-agent card directly (compare with above)
+# ─────────────────────────────────────────────────
+
+curl -s http://localhost:9000/.well-known/agent-card.json | jq .
+
+
+# ─────────────────────────────────────────────────
+# 3. Send a message (non-streaming, message/send)
+#    Should return a single JSON-RPC response
+# ─────────────────────────────────────────────────
+
+curl -s -X POST http://localhost:8080 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer test-token-123" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "req-1",
+    "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message",
+        "messageId": "msg-1",
+        "role": "user",
+        "parts": [
+          { "kind": "text", "text": "What is 2 + 2?" }
+        ]
+      }
+    }
+  }' | jq .
+
+
+# ─────────────────────────────────────────────────
+# 4. Stream a message (SSE, message/stream)
+#    -N disables curl buffering so you see events live
+#    You should see JSON-RPC events arriving incrementally
+# ─────────────────────────────────────────────────
+
+curl -N -X POST http://localhost:8080 \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -H "Authorization: Bearer test-token-123" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "req-2",
+    "method": "message/stream",
+    "params": {
+      "message": {
+        "kind": "message",
+        "messageId": "msg-2",
+        "role": "user",
+        "parts": [
+          { "kind": "text", "text": "Explain what cloud run is in 3 sentences" }
+        ]
+      }
+    }
+  }'
+
+
+# ─────────────────────────────────────────────────
+# 5. Test auth rejection (no token)
+#    Should return JSON-RPC error -32004
+# ─────────────────────────────────────────────────
+
+curl -s -X POST http://localhost:8080 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "req-3",
+    "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message",
+        "messageId": "msg-3",
+        "role": "user",
+        "parts": [
+          { "kind": "text", "text": "This should fail" }
+        ]
+      }
+    }
+  }' | jq .
+
+
+# ─────────────────────────────────────────────────
+# 6. Test invalid body (missing parts)
+#    Should return JSON-RPC error -32602
+# ─────────────────────────────────────────────────
+
+curl -s -X POST http://localhost:8080 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer test-token-123" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "req-4",
+    "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message",
+        "role": "user"
+      }
+    }
+  }' | jq .
+
+
+# ─────────────────────────────────────────────────
+# 7. Test agent unavailable (stop data-agent first,
+#    then run this — should return -32001)
+# ─────────────────────────────────────────────────
+
+curl -s -X POST http://localhost:8080 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer test-token-123" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "req-5",
+    "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message",
+        "messageId": "msg-5",
+        "role": "user",
+        "parts": [
+          { "kind": "text", "text": "Are you there?" }
+        ]
+      }
+    }
+  }' | jq .
+
+
+# ─────────────────────────────────────────────────
+# 8. Longer streaming test (watch tokens arrive)
+#    Good for verifying SSE works end-to-end
+# ─────────────────────────────────────────────────
+
+curl -N -X POST http://localhost:8080 \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -H "Authorization: Bearer test-token-123" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "req-6",
+    "method": "message/stream",
+    "params": {
+      "message": {
+        "kind": "message",
+        "messageId": "msg-6",
+        "role": "user",
+        "parts": [
+          { "kind": "text", "text": "List the top 5 benefits of using Cloud Run for deploying AI agents. Be detailed." }
+        ]
+      }
+    }
+  }'
