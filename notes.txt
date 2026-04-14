@@ -1,0 +1,481 @@
+package com.enterprise.router.service;
+
+import com.enterprise.router.auth.GoogleAuthFilter;
+import com.enterprise.router.config.RouterConfig;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.a2a.client.A2ACardResolver;
+import io.a2a.client.Client;
+import io.a2a.client.ClientConfig;
+import io.a2a.client.ClientEvent;
+import io.a2a.client.MessageEvent;
+import io.a2a.client.TaskEvent;
+import io.a2a.client.TaskUpdateEvent;
+import io.a2a.client.http.JdkA2AHttpClient;
+import io.a2a.client.transport.JSONRPCTransport;
+import io.a2a.client.transport.JSONRPCTransportConfig;
+import io.a2a.spec.A2A;
+import io.a2a.spec.AgentCard;
+import io.a2a.spec.Message;
+import io.a2a.spec.TextPart;
+import io.a2a.spec.Task;
+import io.a2a.spec.TaskState;
+import io.smallrye.mutiny.Multi;
+import io.smallrye.mutiny.subscription.MultiEmitter;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+import org.jboss.logging.Logger;
+import org.jboss.resteasy.reactive.RestStreamElementType;
+
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+
+/**
+ * Routing service — thin A2A proxy with virtual-thread concurrency.
+ *
+ * Each inbound request is dispatched onto a virtual thread via
+ * {@link Executors#newVirtualThreadPerTaskExecutor()}. Virtual threads
+ * are ideal here because the routing agent is entirely I/O-bound:
+ * every request blocks on the outbound HTTP call to the data-agent
+ * and then on the SSE stream read. With virtual threads, 100+
+ * concurrent requests each get their own thread at ~few KB cost
+ * (vs ~1MB per platform thread), and the JVM multiplexes them
+ * onto a small pool of carrier threads automatically.
+ *
+ * The A2A SDK Client handles protocol mechanics (JSON-RPC envelope,
+ * SSE parsing, streaming negotiation). This service handles:
+ *   - Dispatching requests onto virtual threads
+ *   - Extracting the user message from the JSON-RPC body
+ *   - Relaying typed SDK events back as SSE to the caller
+ *   - Responding directly with JSON-RPC errors when things fail
+ *
+ * Lifecycle:
+ *   @PostConstruct  → creates the virtual thread executor + A2A Client
+ *   @PreDestroy     → shuts down the executor cleanly
+ */
+@ApplicationScoped
+@Path("/")
+public class RoutingService {
+
+    private static final Logger LOG = Logger.getLogger(RoutingService.class);
+    private static final long RESPONSE_TIMEOUT_SECONDS = 300;
+
+    @Inject
+    RouterConfig config;
+
+    @Inject
+    ObjectMapper objectMapper;
+
+    private ExecutorService virtualExecutor;
+    private Client a2aClient;
+
+    @PostConstruct
+    void init() {
+        // ── Virtual thread executor ──────────────────────────────
+        // One virtual thread per request. No pool size limit needed —
+        // virtual threads are cheap. The JVM schedules them onto
+        // ForkJoinPool.commonPool() carrier threads automatically.
+        virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        LOG.info("Virtual thread executor initialized");
+
+        // ── A2A SDK Client ───────────────────────────────────────
+        try {
+            String baseUrl = config.dataAgent().baseUrl();
+            String cardUrl = baseUrl + config.dataAgent().agentCardPath();
+
+            LOG.infof("Initializing A2A SDK Client for data-agent: %s", baseUrl);
+
+            AgentCard dataAgentCard = new A2ACardResolver(
+                new JdkA2AHttpClient(),
+                baseUrl,
+                cardUrl
+            ).getAgentCard();
+
+            boolean supportsStreaming = dataAgentCard.capabilities() != null
+                && dataAgentCard.capabilities().streaming();
+
+            a2aClient = Client.builder(dataAgentCard)
+                .withTransport(JSONRPCTransport.class, new JSONRPCTransportConfig())
+                .clientConfig(
+                    new ClientConfig.Builder()
+                        .setStreaming(supportsStreaming)
+                        .setAcceptedOutputModes(List.of("text"))
+                        .build()
+                )
+                .build();
+
+            LOG.infof("A2A Client ready: agent=%s, streaming=%s",
+                dataAgentCard.name(), supportsStreaming);
+
+        } catch (Exception e) {
+            LOG.errorf(e, "Failed to initialize A2A Client — data-agent may be unavailable");
+        }
+    }
+
+    @PreDestroy
+    void shutdown() {
+        if (virtualExecutor != null) {
+            LOG.info("Shutting down virtual thread executor");
+            virtualExecutor.shutdown();
+            try {
+                if (!virtualExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    virtualExecutor.shutdownNow();
+                    LOG.warn("Virtual thread executor forced shutdown");
+                }
+            } catch (InterruptedException e) {
+                virtualExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    // ── Streaming endpoint ──────────────────────────────────────
+
+    /**
+     * Streaming proxy: dispatches onto a virtual thread, sends to
+     * data-agent via A2A SDK Client, relays SSE events back.
+     *
+     * The Multi emitter bridges the virtual thread (which blocks on
+     * SDK I/O) to Quarkus's reactive SSE pipeline (which streams
+     * events non-blocking to the caller).
+     */
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.SERVER_SENT_EVENTS)
+    @RestStreamElementType(MediaType.APPLICATION_JSON)
+    public Multi<String> stream(
+            String body,
+            @Context ContainerRequestContext ctx) {
+
+        String token = (String) ctx.getProperty(GoogleAuthFilter.TOKEN_PROPERTY);
+
+        if (a2aClient == null) {
+            return errorStream(-32001, "Agent unavailable",
+                "The downstream agent is not reachable. Please try again later.");
+        }
+
+        String userText = extractUserText(body);
+        if (userText == null) {
+            return errorStream(-32602, "Invalid params",
+                "Could not extract message text from request.");
+        }
+
+        LOG.debugf("Dispatching streaming request to virtual thread (%d chars)", userText.length());
+
+        return Multi.createFrom().<String>emitter(emitter -> {
+            // Dispatch the blocking SDK call onto a virtual thread.
+            // The emitter is thread-safe — the virtual thread emits
+            // events into it, Quarkus streams them out as SSE.
+            virtualExecutor.submit(() -> {
+                try {
+                    List<BiConsumer<ClientEvent, AgentCard>> consumers = List.of(
+                        (event, card) -> relayEvent(event, emitter)
+                    );
+
+                    Consumer<Throwable> errorHandler = error -> {
+                        LOG.errorf(error, "Streaming error from data-agent");
+                        emitter.emit(formatJsonRpcError(-32002, "Downstream error",
+                            "Data agent encountered an error during streaming."));
+                        emitter.complete();
+                    };
+
+                    // TODO: Forward Google token via custom A2AHttpClient
+                    // that injects X-Forwarded-Authorization header.
+
+                    Message message = A2A.toUserMessage(userText);
+                    a2aClient.sendMessage(message, consumers, errorHandler);
+
+                } catch (Exception e) {
+                    LOG.errorf(e, "Virtual thread failed to send message");
+                    emitter.emit(formatJsonRpcError(-32001, "Agent unavailable",
+                        "Failed to communicate with the downstream agent."));
+                    emitter.complete();
+                }
+            });
+        });
+    }
+
+    // ── Non-streaming endpoint ──────────────────────────────────
+
+    /**
+     * Synchronous proxy: dispatches onto a virtual thread, collects
+     * the full response via CompletableFuture, returns single JSON.
+     *
+     * The calling Quarkus I/O thread is freed immediately. The virtual
+     * thread blocks on the SDK call and completes the future when
+     * the data-agent responds.
+     */
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response send(
+            String body,
+            @Context ContainerRequestContext ctx) {
+
+        String token = (String) ctx.getProperty(GoogleAuthFilter.TOKEN_PROPERTY);
+
+        if (a2aClient == null) {
+            return jsonRpcErrorResponse(502, -32001, "Agent unavailable",
+                "The downstream agent is not reachable. Please try again later.");
+        }
+
+        String userText = extractUserText(body);
+        if (userText == null) {
+            return jsonRpcErrorResponse(400, -32602, "Invalid params",
+                "Could not extract message text from request.");
+        }
+
+        LOG.debugf("Dispatching sync request to virtual thread (%d chars)", userText.length());
+
+        CompletableFuture<String> responseFuture = new CompletableFuture<>();
+
+        // Dispatch the blocking SDK call onto a virtual thread
+        virtualExecutor.submit(() -> {
+            try {
+                List<BiConsumer<ClientEvent, AgentCard>> consumers = List.of(
+                    (event, card) -> {
+                        String text = extractTextFromEvent(event);
+                        if (text != null && !responseFuture.isDone()) {
+                            responseFuture.complete(text);
+                        }
+                    }
+                );
+
+                Consumer<Throwable> errorHandler = error -> {
+                    LOG.errorf(error, "Data-agent error (sync)");
+                    responseFuture.completeExceptionally(error);
+                };
+
+                Message message = A2A.toUserMessage(userText);
+                a2aClient.sendMessage(message, consumers, errorHandler);
+
+            } catch (Exception e) {
+                responseFuture.completeExceptionally(e);
+            }
+        });
+
+        // Wait for the virtual thread to complete (or timeout)
+        try {
+            String responseText = responseFuture.get(RESPONSE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+            String jsonRpcResult = String.format(
+                "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{\"message\":{\"role\":\"agent\",\"parts\":[{\"kind\":\"text\",\"text\":%s}]}}}",
+                escapeJson(responseText));
+
+            return Response.ok(jsonRpcResult, MediaType.APPLICATION_JSON).build();
+
+        } catch (TimeoutException e) {
+            return jsonRpcErrorResponse(504, -32003, "Timeout",
+                "The downstream agent did not respond in time.");
+        } catch (Exception e) {
+            LOG.errorf(e, "Sync proxy request failed");
+            return jsonRpcErrorResponse(502, -32002, "Downstream error",
+                "Data agent encountered an error.");
+        }
+    }
+
+    // ── Event Relay ─────────────────────────────────────────────
+
+    private void relayEvent(ClientEvent event, MultiEmitter<? super String> emitter) {
+        if (event instanceof MessageEvent messageEvent) {
+            String text = extractTextFromMessage(messageEvent.getMessage());
+            if (text != null) {
+                emitter.emit(formatMessageEvent(text, false));
+            }
+
+        } else if (event instanceof TaskEvent taskEvent) {
+            Task task = taskEvent.getTask();
+            String text = extractTextFromTask(task);
+            boolean isFinal = task.status() != null
+                && task.status().state() == TaskState.COMPLETED;
+            emitter.emit(formatMessageEvent(text != null ? text : "", isFinal));
+            if (isFinal) {
+                emitter.complete();
+            }
+
+        } else if (event instanceof TaskUpdateEvent updateEvent) {
+            Task task = updateEvent.getTask();
+            boolean isFinal = updateEvent.isFinal();
+            String text = "";
+            if (task.status() != null && task.status().message() != null) {
+                text = extractTextFromMessage(task.status().message());
+            }
+            emitter.emit(formatMessageEvent(text != null ? text : "", isFinal));
+            if (isFinal) {
+                emitter.complete();
+            }
+        }
+    }
+
+    // ── Text Extraction ─────────────────────────────────────────
+
+    private String extractTextFromEvent(ClientEvent event) {
+        if (event instanceof MessageEvent me) {
+            return extractTextFromMessage(me.getMessage());
+        } else if (event instanceof TaskEvent te) {
+            return extractTextFromTask(te.getTask());
+        } else if (event instanceof TaskUpdateEvent ue) {
+            if (ue.getTask().status() != null && ue.getTask().status().message() != null) {
+                return extractTextFromMessage(ue.getTask().status().message());
+            }
+        }
+        return null;
+    }
+
+    private String extractTextFromMessage(Message message) {
+        if (message == null || message.parts() == null) return null;
+        return message.parts().stream()
+            .filter(p -> p instanceof TextPart)
+            .map(p -> ((TextPart) p).text())
+            .findFirst()
+            .orElse(null);
+    }
+
+    private String extractTextFromTask(Task task) {
+        if (task == null || task.artifacts() == null) return null;
+        return task.artifacts().stream()
+            .flatMap(a -> a.parts() != null ? a.parts().stream() : java.util.stream.Stream.empty())
+            .filter(p -> p instanceof TextPart)
+            .map(p -> ((TextPart) p).text())
+            .findFirst()
+            .orElse(null);
+    }
+
+    private String extractUserText(String body) {
+        try {
+            var tree = objectMapper.readTree(body);
+            var parts = tree.at("/params/message/parts");
+            if (parts.isMissingNode() || !parts.isArray()) return null;
+
+            for (var part : parts) {
+                String kind = part.has("kind") ? part.get("kind").asText() : null;
+                if ("text".equals(kind) && part.has("text")) {
+                    return part.get("text").asText();
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            LOG.debugf("Failed to extract user text: %s", e.getMessage());
+            return null;
+        }
+    }
+
+    // ── JSON-RPC Formatting ─────────────────────────────────────
+
+    private String formatMessageEvent(String text, boolean isFinal) {
+        return String.format(
+            "{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{\"event\":\"message\",\"data\":{\"text\":%s},\"final\":%s}}",
+            escapeJson(text), isFinal);
+    }
+
+    private String formatJsonRpcError(int code, String message, String data) {
+        return String.format(
+            "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":%d,\"message\":\"%s\",\"data\":\"%s\"}}",
+            code, message, data);
+    }
+
+    private Multi<String> errorStream(int code, String message, String data) {
+        return Multi.createFrom().item(formatJsonRpcError(code, message, data));
+    }
+
+    private Response jsonRpcErrorResponse(int httpStatus, int code, String message, String data) {
+        return Response.status(httpStatus)
+            .type(MediaType.APPLICATION_JSON)
+            .entity(formatJsonRpcError(code, message, data))
+            .build();
+    }
+
+    private String escapeJson(String value) {
+        if (value == null) return "null";
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (Exception e) {
+            return "\"" + value.replace("\"", "\\\"") + "\"";
+        }
+    }
+}
+
+
+--------------------------------------------------------
+
+package com.enterprise.router.auth;
+
+import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.container.ContainerRequestFilter;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.ext.Provider;
+import org.jboss.logging.Logger;
+
+/**
+ * PLACEHOLDER Google token authentication filter.
+ *
+ * Extracts the Bearer token and stashes it in the request context.
+ * Returns a JSON-RPC -32004 error if the token is missing.
+ *
+ * TODO: Implement real validation:
+ *   1. Fetch Google JWKS from https://www.googleapis.com/oauth2/v3/certs
+ *   2. Verify JWT signature (RS256)
+ *   3. Validate exp, iss (accounts.google.com), aud (your project ID)
+ */
+@Provider
+public class GoogleAuthFilter implements ContainerRequestFilter {
+
+    private static final Logger LOG = Logger.getLogger(GoogleAuthFilter.class);
+    public static final String TOKEN_PROPERTY = "google.auth.token";
+
+    private static final String JSONRPC_UNAUTHORIZED = """
+            {"jsonrpc":"2.0","id":null,"error":{"code":-32004,"message":"Unauthorized","data":"Missing or invalid Authorization header. Expected: Bearer <token>"}}""";
+
+    private static final String JSONRPC_REAUTH = """
+            {"jsonrpc":"2.0","id":null,"error":{"code":-32004,"message":"Re-authenticate","data":"Your token is invalid or expired. Please re-authenticate and try again."}}""";
+
+    @Override
+    public void filter(ContainerRequestContext ctx) {
+        // Skip auth for agent card discovery
+        if (ctx.getUriInfo().getPath().contains(".well-known")) {
+            return;
+        }
+
+        String authHeader = ctx.getHeaderString("Authorization");
+        String token = extractBearer(authHeader);
+
+        if (token == null) {
+            LOG.debug("No Bearer token — rejecting with -32004");
+            ctx.abortWith(Response.status(Response.Status.UNAUTHORIZED)
+                .type(MediaType.APPLICATION_JSON)
+                .entity(JSONRPC_UNAUTHORIZED)
+                .header("WWW-Authenticate", "Bearer realm=\"gemini-enterprise\"")
+                .build());
+            return;
+        }
+
+        // TODO: Validate token here. On failure:
+        //   ctx.abortWith(Response.status(401)
+        //       .entity(JSONRPC_REAUTH).build());
+
+        ctx.setProperty(TOKEN_PROPERTY, token);
+        LOG.debugf("Token extracted (%d chars) — forwarding", token.length());
+    }
+
+    private static String extractBearer(String header) {
+        if (header == null || header.length() <= 7) return null;
+        if (header.substring(0, 7).equalsIgnoreCase("Bearer ")) {
+            String t = header.substring(7).trim();
+            return t.isEmpty() ? null : t;
+        }
+        return null;
+    }
+}
