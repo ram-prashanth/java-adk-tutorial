@@ -1,3 +1,30 @@
+
+curl -X POST http://localhost:8080 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "test-1",
+    "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message",
+        "messageId": "msg-001",
+        "role": "user",
+        "parts": [
+          {
+            "kind": "text",
+            "text": "Hi"
+          }
+        ]
+      },
+      "configuration": {
+        "acceptedOutputModes": ["text"],
+        "returnImmediately": false
+      }
+    }
+  }'
+
+
 # ─────────────────────────────────────────────────
 # 1. Verify agent card discovery
 #    Should show data-agent's skills with routing-agent's URL
