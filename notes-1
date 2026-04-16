@@ -1,60 +1,3 @@
-package com.enterprise.router.executor;
-
-import com.enterprise.router.config.RouterConfig;
-import io.a2a.client.A2ACardResolver;
-import io.a2a.client.Client;
-import io.a2a.client.ClientConfig;
-import io.a2a.client.ClientEvent;
-import io.a2a.client.MessageEvent;
-import io.a2a.client.TaskEvent;
-import io.a2a.client.TaskUpdateEvent;
-import io.a2a.client.http.JdkA2AHttpClient;
-import io.a2a.client.transport.JSONRPCTransport;
-import io.a2a.client.transport.JSONRPCTransportConfig;
-import io.a2a.server.agentexecution.AgentExecutor;
-import io.a2a.server.agentexecution.RequestContext;
-import io.a2a.server.tasks.AgentEmitter;
-import io.a2a.spec.A2A;
-import io.a2a.spec.AgentCard;
-import io.a2a.spec.JSONRPCError;
-import io.a2a.spec.Message;
-import io.a2a.spec.Part;
-import io.a2a.spec.TextPart;
-import io.a2a.spec.Task;
-import io.a2a.spec.TaskState;
-import io.a2a.spec.TaskNotCancelableError;
-import org.jboss.logging.Logger;
-
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.function.BiConsumer;
-import java.util.function.Consumer;
-
-/**
- * Routing executor — implements A2A SDK's {@link AgentExecutor} interface.
- *
- * The SDK reference server handles all protocol mechanics:
- *   - POST / endpoint (JSON-RPC parsing, SSE streaming)
- *   - Agent card serving at /.well-known/agent-card.json
- *   - Task lifecycle management
- *   - Error envelope formatting
- *
- * This executor's only job: receive the parsed request via
- * {@link #execute(RequestContext, AgentEmitter)}, forward it to
- * the data-agent via the A2A SDK Client, and relay events back
- * through the AgentEmitter.
- *
- * Uses {@link Executors#newVirtualThreadPerTaskExecutor()} to dispatch
- * the blocking A2A SDK Client call. Each concurrent request gets its
- * own virtual thread (~few KB), so 100+ concurrent requests are cheap.
- *
- * Error paths (data-agent down, timeout, streaming failure) are handled
- * directly — the routing agent responds via AgentEmitter without
- * needing the data-agent.
- */
 public class RoutingExecutor implements AgentExecutor {
 
     private static final Logger LOG = Logger.getLogger(RoutingExecutor.class);
@@ -66,127 +9,93 @@ public class RoutingExecutor implements AgentExecutor {
     public RoutingExecutor(Client a2aClient) {
         this.a2aClient = a2aClient;
         this.virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
-        LOG.info("RoutingExecutor initialized with virtual thread executor");
     }
 
-    /**
-     * Called by the SDK reference server for each inbound request.
-     *
-     * The SDK has already:
-     *   - Parsed the JSON-RPC envelope
-     *   - Extracted the Message from params
-     *   - Created or resolved the Task
-     *   - Set up SSE streaming (if message/stream)
-     *
-     * We:
-     *   1. Mark the task as submitted + working
-     *   2. Extract user text from the request context
-     *   3. Dispatch to a virtual thread
-     *   4. Forward to data-agent via A2A SDK Client
-     *   5. Relay events back through AgentEmitter
-     *   6. Mark complete (or error)
-     */
     @Override
-    public void execute(RequestContext context, AgentEmitter emitter) throws JSONRPCError {
-        // Mark task lifecycle
-        if (context.getTask() == null) {
-            emitter.submit();
-        }
-        emitter.startWork();
+    public void execute(RequestContext context, EventQueue eventQueue) 
+            throws JSONRPCError {
+        
+        // TaskUpdater wraps EventQueue with task lifecycle helpers
+        TaskUpdater updater = new TaskUpdater(context, eventQueue);
 
-        // Extract user text
+        if (context.getTask() == null) {
+            updater.submit();
+        }
+        updater.startWork();
+
         String userText = extractTextFromMessage(context.getMessage());
         if (userText == null || userText.isBlank()) {
-            emitter.error("Invalid request: no text content in message");
+            updater.updateStatus(TaskState.FAILED, agentMessage("No text content"));
             return;
         }
 
-        LOG.debugf("Forwarding to data-agent: %d chars", userText.length());
-
-        // Dispatch to virtual thread — the SDK Client call may block
-        // on SSE stream reading, and we don't want to block the
-        // SDK's request-handling thread.
         CompletableFuture<Void> completion = new CompletableFuture<>();
 
         virtualExecutor.submit(() -> {
             try {
-                forwardToDataAgent(userText, emitter, completion);
+                forwardToDataAgent(userText, updater, completion);
             } catch (Exception e) {
-                LOG.errorf(e, "Virtual thread failed during forwarding");
-                emitter.error("Downstream agent communication failed");
+                LOG.errorf(e, "Forwarding failed");
+                updater.updateStatus(TaskState.FAILED, 
+                    agentMessage("Downstream agent communication failed"));
                 completion.complete(null);
             }
         });
 
-        // Wait for the virtual thread to finish relaying all events.
-        // This keeps the execute() method alive so the SDK doesn't
-        // close the SSE connection prematurely.
         try {
             completion.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (Exception e) {
-            LOG.errorf(e, "Timed out waiting for data-agent response");
-            emitter.error("Request timed out waiting for downstream agent");
+            LOG.errorf(e, "Timed out");
+            updater.updateStatus(TaskState.FAILED, 
+                agentMessage("Request timed out"));
         }
     }
 
     @Override
-    public void cancel(RequestContext context, AgentEmitter emitter) throws JSONRPCError {
-        // TODO: Forward cancellation to data-agent if it supports it.
-        // For now, reject with not-cancelable.
+    public void cancel(RequestContext context, EventQueue eventQueue) 
+            throws JSONRPCError {
         throw new TaskNotCancelableError();
     }
 
-    // ── Data Agent Forwarding ───────────────────────────────────
-
-    /**
-     * Sends the user message to the data-agent via A2A SDK Client
-     * and relays each event back through the AgentEmitter.
-     */
     private void forwardToDataAgent(
             String userText,
-            AgentEmitter emitter,
+            TaskUpdater updater,
             CompletableFuture<Void> completion) {
 
         List<BiConsumer<ClientEvent, AgentCard>> consumers = List.of(
-            (event, card) -> relayEvent(event, emitter, completion)
+            (event, card) -> relayEvent(event, updater, completion)
         );
 
         Consumer<Throwable> errorHandler = error -> {
             LOG.errorf(error, "Streaming error from data-agent");
-            emitter.error("Data agent encountered an error during streaming");
+            updater.updateStatus(TaskState.FAILED, 
+                agentMessage("Data agent streaming error"));
             completion.complete(null);
         };
 
         try {
-            // TODO: Forward Google token via custom A2AHttpClient
-            // that injects X-Forwarded-Authorization header.
-
             Message message = A2A.toUserMessage(userText);
             a2aClient.sendMessage(message, consumers, errorHandler);
-
         } catch (Exception e) {
-            LOG.errorf(e, "Failed to send message to data-agent");
-            emitter.error("Failed to reach downstream agent");
+            LOG.errorf(e, "Failed to send");
+            updater.updateStatus(TaskState.FAILED, 
+                agentMessage("Failed to reach downstream agent"));
             completion.complete(null);
         }
     }
 
-    /**
-     * Relays a typed A2A SDK ClientEvent through the AgentEmitter.
-     *
-     * The AgentEmitter handles task state transitions and SSE
-     * serialization — we just need to push the content through.
-     */
     private void relayEvent(
             ClientEvent event,
-            AgentEmitter emitter,
+            TaskUpdater updater,
             CompletableFuture<Void> completion) {
 
         try {
             if (event instanceof MessageEvent messageEvent) {
-                String text = extractTextFromMessage(messageEvent.getMessage());
+                String text = extractTextFromMessage(
+                    messageEvent.getMessage());
                 if (text != null) {
-                    emitter.updateStatus(TaskState.WORKING, agentMessage(text));
+                    updater.updateStatus(TaskState.WORKING, 
+                        agentMessage(text));
                 }
 
             } else if (event instanceof TaskEvent taskEvent) {
@@ -196,12 +105,10 @@ public class RoutingExecutor implements AgentExecutor {
                     && task.status().state() == TaskState.COMPLETED;
 
                 if (text != null) {
-                    List<Part<?>> parts = List.of(new TextPart(text));
-                    emitter.addArtifact(parts);
+                    updater.addArtifact(List.of(new TextPart(text)));
                 }
-
                 if (isFinal) {
-                    emitter.complete();
+                    updater.complete();
                     completion.complete(null);
                 }
 
@@ -209,145 +116,38 @@ public class RoutingExecutor implements AgentExecutor {
                 Task task = updateEvent.getTask();
                 boolean isFinal = updateEvent.isFinal();
 
-                // Relay status message text
                 String statusText = null;
-                if (task.status() != null && task.status().message() != null) {
-                    statusText = extractTextFromMessage(task.status().message());
+                if (task.status() != null 
+                        && task.status().message() != null) {
+                    statusText = extractTextFromMessage(
+                        task.status().message());
                 }
 
                 if (statusText != null) {
-                    emitter.updateStatus(
+                    updater.updateStatus(
                         isFinal ? TaskState.COMPLETED : TaskState.WORKING,
                         agentMessage(statusText));
                 }
 
-                // Relay artifacts if present
                 if (task.artifacts() != null) {
                     for (var artifact : task.artifacts()) {
-                        if (artifact.parts() != null && !artifact.parts().isEmpty()) {
-                            emitter.addArtifact(artifact.parts());
+                        if (artifact.parts() != null 
+                                && !artifact.parts().isEmpty()) {
+                            updater.addArtifact(artifact.parts());
                         }
                     }
                 }
 
                 if (isFinal) {
-                    emitter.complete();
+                    updater.complete();
                     completion.complete(null);
                 }
             }
         } catch (Exception e) {
-            LOG.errorf(e, "Error relaying event through AgentEmitter");
+            LOG.errorf(e, "Error relaying event");
             completion.complete(null);
         }
     }
 
-    // ── Helpers ──────────────────────────────────────────────────
-
-    private String extractTextFromMessage(Message message) {
-        if (message == null || message.parts() == null) return null;
-        return message.parts().stream()
-            .filter(p -> p instanceof TextPart)
-            .map(p -> ((TextPart) p).text())
-            .findFirst()
-            .orElse(null);
-    }
-
-    private String extractTextFromTask(Task task) {
-        if (task == null || task.artifacts() == null) return null;
-        return task.artifacts().stream()
-            .flatMap(a -> a.parts() != null ? a.parts().stream() : java.util.stream.Stream.empty())
-            .filter(p -> p instanceof TextPart)
-            .map(p -> ((TextPart) p).text())
-            .findFirst()
-            .orElse(null);
-    }
-
-    private Message agentMessage(String text) {
-        return new Message.Builder()
-            .role(Message.Role.AGENT)
-            .parts(List.of(new TextPart(text)))
-            .build();
-    }
-}
-
-
-
-
-
-
-
-
-
--==============package com.enterprise.router.executor;
-
-import com.enterprise.router.config.RouterConfig;
-import io.a2a.client.A2ACardResolver;
-import io.a2a.client.Client;
-import io.a2a.client.ClientConfig;
-import io.a2a.client.http.JdkA2AHttpClient;
-import io.a2a.client.transport.JSONRPCTransport;
-import io.a2a.client.transport.JSONRPCTransportConfig;
-import io.a2a.server.agentexecution.AgentExecutor;
-import io.a2a.spec.AgentCard;
-import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.inject.Produces;
-import jakarta.inject.Inject;
-import org.jboss.logging.Logger;
-
-import java.util.List;
-
-/**
- * CDI producer that wires the routing agent's AgentExecutor.
- *
- * Builds the A2A SDK Client for the data-agent at startup, then
- * produces a {@link RoutingExecutor} that the SDK reference server
- * will call for each inbound request.
- *
- * The SDK reference server auto-discovers this bean and handles:
- *   - POST / endpoint (JSON-RPC + SSE)
- *   - Task lifecycle
- *   - Error formatting
- *   - Streaming
- *
- * All we produce is the executor that does the forwarding work.
- */
-@ApplicationScoped
-public class RoutingExecutorProducer {
-
-    private static final Logger LOG = Logger.getLogger(RoutingExecutorProducer.class);
-
-    @Inject
-    RouterConfig config;
-
-    @Produces
-    public AgentExecutor agentExecutor() {
-        String baseUrl = config.dataAgent().baseUrl();
-        String cardUrl = baseUrl + config.dataAgent().agentCardPath();
-
-        LOG.infof("Building A2A Client for data-agent: %s", baseUrl);
-
-        AgentCard dataAgentCard = new A2ACardResolver(
-            new JdkA2AHttpClient(),
-            baseUrl,
-            cardUrl
-        ).getAgentCard();
-
-        boolean supportsStreaming = dataAgentCard.capabilities() != null
-            && dataAgentCard.capabilities().streaming();
-
-        Client a2aClient = Client.builder(dataAgentCard)
-            .withTransport(JSONRPCTransport.class, new JSONRPCTransportConfig())
-            .clientConfig(
-                new ClientConfig.Builder()
-                    .setStreaming(supportsStreaming)
-                    .setAcceptedOutputModes(List.of("text"))
-                    .build()
-            )
-            .build();
-
-        LOG.infof("A2A Client ready: agent=%s, streaming=%s",
-            dataAgentCard.name(), supportsStreaming);
-
-        return new RoutingExecutor(a2aClient);
-    }
+    // helpers unchanged...
 }
