@@ -2,36 +2,36 @@ public class TokenRefreshingMcpToolset extends McpToolset {
 
     private static final Logger logger = LoggerFactory.getLogger(TokenRefreshingMcpToolset.class);
 
-    private final AtlanTokenService tokenService;
+    private final Supplier<String> tokenSupplier;
     private final String mcpUrl;
     private final ObjectMapper objectMapper;
     private volatile String currentToken;
 
     public TokenRefreshingMcpToolset(
-            AtlanTokenService tokenService,
             String mcpUrl,
+            Supplier<String> tokenSupplier) {
+        this(mcpUrl, tokenSupplier, JsonBaseModel.getMapper());
+    }
+
+    public TokenRefreshingMcpToolset(
+            String mcpUrl,
+            Supplier<String> tokenSupplier,
             ObjectMapper objectMapper) {
-        // Initialize parent with current token
-        super(buildParams(mcpUrl, tokenService.getToken()), objectMapper);
-        this.tokenService = tokenService;
+        super(buildParams(mcpUrl, tokenSupplier.get()), objectMapper);
+        this.tokenSupplier = tokenSupplier;
         this.mcpUrl = mcpUrl;
         this.objectMapper = objectMapper;
-        this.currentToken = tokenService.getToken();
+        this.currentToken = tokenSupplier.get();
     }
 
     @Override
     public Flowable<BaseTool> getTools(ReadonlyContext readonlyContext) {
-        String freshToken = tokenService.getToken();
+        String freshToken = tokenSupplier.get();
 
-        // If token changed — close old session and force parent to reinitialize
         if (!freshToken.equals(currentToken)) {
-            logger.info("[MCP] Token changed — closing stale MCP session");
+            logger.info("[MCP] Token changed — rebuilding MCP session for: {}", mcpUrl);
             currentToken = freshToken;
-            this.close(); // sets mcpSession = null in parent
-
-            // Rebuild the mcpSessionManager with fresh token by replacing it
-            // McpSessionManager is stored as field in parent — we need to rebuild
-            // the whole toolset via a new McpSessionManager
+            this.close();
             rebuildSessionManager(freshToken);
         }
 
@@ -40,7 +40,6 @@ public class TokenRefreshingMcpToolset extends McpToolset {
 
     private void rebuildSessionManager(String newToken) {
         try {
-            // McpSessionManager field is private in parent — use reflection to replace it
             var field = McpToolset.class.getDeclaredField("mcpSessionManager");
             field.setAccessible(true);
             field.set(this, new McpSessionManager(buildParams(mcpUrl, newToken)));
@@ -56,3 +55,67 @@ public class TokenRefreshingMcpToolset extends McpToolset {
             .build();
     }
 }
+
+
+
+******************************
+@ApplicationScoped
+@Startup
+public class AtlanTokenService {
+
+    private static final Logger logger = LoggerFactory.getLogger(AtlanTokenService.class);
+
+    @ConfigProperty(name = "atlan.oauth.url")
+    String oauthUrl;
+
+    @ConfigProperty(name = "atlan.oauth.client-id")
+    String clientId;
+
+    @ConfigProperty(name = "atlan.oauth.client-secret")
+    String clientSecret;
+
+    private String cachedToken;
+    private Instant tokenExpiry = Instant.MIN;
+
+    @PostConstruct
+    void init() {
+        refreshToken();
+    }
+
+    public synchronized String getToken() {
+        if (cachedToken == null || Instant.now().isAfter(tokenExpiry.minusMinutes(5))) {
+            refreshToken();
+        }
+        return cachedToken;
+    }
+
+    private void refreshToken() {
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(oauthUrl))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString(
+                    "grant_type=client_credentials"
+                    + "&client_id=" + clientId
+                    + "&client_secret=" + clientSecret))
+                .build();
+
+            HttpResponse<String> response = HttpClient.newHttpClient()
+                .send(request, HttpResponse.BodyHandlers.ofString());
+
+            var json = new ObjectMapper().readTree(response.body());
+            cachedToken = json.get("access_token").asText();
+            int expiresIn = json.has("expires_in") 
+                ? json.get("expires_in").asInt() 
+                : 3600;
+            tokenExpiry = Instant.now().plusSeconds(expiresIn);
+
+            logger.info("[TOKEN] Refreshed — expires in {}s", expiresIn);
+        } catch (Exception e) {
+            logger.error("[TOKEN] Refresh failed — keeping existing token", e);
+        }
+    }
+}
+
+
+
