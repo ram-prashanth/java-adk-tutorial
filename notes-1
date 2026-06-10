@@ -1,153 +1,29 @@
-public class RoutingExecutor implements AgentExecutor {
+private void refreshToken() {
+    try {
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(oauthUrl))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .POST(HttpRequest.BodyPublishers.ofString(
+                "grant_type=client_credentials"
+                + "&client_id=" + clientId
+                + "&client_secret=" + clientSecret))
+            .build();
 
-    private static final Logger LOG = Logger.getLogger(RoutingExecutor.class);
-    private static final long TIMEOUT_SECONDS = 300;
+        HttpResponse<String> response = HttpClient.newHttpClient()
+            .send(request, HttpResponse.BodyHandlers.ofString());
 
-    private final Client a2aClient;
-    private final ExecutorService virtualExecutor;
-
-    public RoutingExecutor(Client a2aClient) {
-        this.a2aClient = a2aClient;
-        this.virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
-    }
-
-    @Override
-    public void execute(RequestContext context, EventQueue eventQueue) 
-            throws JSONRPCError {
+        var json = new ObjectMapper().readTree(response.body());
         
-        // TaskUpdater wraps EventQueue with task lifecycle helpers
-        TaskUpdater updater = new TaskUpdater(context, eventQueue);
+        cachedToken = json.get("accessToken").asText();         // ← camelCase
+        int expiresIn = json.has("expiresIn")
+            ? json.get("expiresIn").asInt()                     // ← camelCase
+            : 3600;
+        tokenExpiry = Instant.now().plusSeconds(expiresIn);
 
-        if (context.getTask() == null) {
-            updater.submit();
-        }
-        updater.startWork();
+        logger.info("[TOKEN] Refreshed — type: {}, expires in {}s",
+            json.get("tokenType").asText(), expiresIn);         // ← log tokenType too
 
-        String userText = extractTextFromMessage(context.getMessage());
-        if (userText == null || userText.isBlank()) {
-            updater.updateStatus(TaskState.FAILED, agentMessage("No text content"));
-            return;
-        }
-
-        CompletableFuture<Void> completion = new CompletableFuture<>();
-
-        virtualExecutor.submit(() -> {
-            try {
-                forwardToDataAgent(userText, updater, completion);
-            } catch (Exception e) {
-                LOG.errorf(e, "Forwarding failed");
-                updater.updateStatus(TaskState.FAILED, 
-                    agentMessage("Downstream agent communication failed"));
-                completion.complete(null);
-            }
-        });
-
-        try {
-            completion.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            LOG.errorf(e, "Timed out");
-            updater.updateStatus(TaskState.FAILED, 
-                agentMessage("Request timed out"));
-        }
+    } catch (Exception e) {
+        logger.error("[TOKEN] Refresh failed — keeping existing token", e);
     }
-
-    @Override
-    public void cancel(RequestContext context, EventQueue eventQueue) 
-            throws JSONRPCError {
-        throw new TaskNotCancelableError();
-    }
-
-    private void forwardToDataAgent(
-            String userText,
-            TaskUpdater updater,
-            CompletableFuture<Void> completion) {
-
-        List<BiConsumer<ClientEvent, AgentCard>> consumers = List.of(
-            (event, card) -> relayEvent(event, updater, completion)
-        );
-
-        Consumer<Throwable> errorHandler = error -> {
-            LOG.errorf(error, "Streaming error from data-agent");
-            updater.updateStatus(TaskState.FAILED, 
-                agentMessage("Data agent streaming error"));
-            completion.complete(null);
-        };
-
-        try {
-            Message message = A2A.toUserMessage(userText);
-            a2aClient.sendMessage(message, consumers, errorHandler);
-        } catch (Exception e) {
-            LOG.errorf(e, "Failed to send");
-            updater.updateStatus(TaskState.FAILED, 
-                agentMessage("Failed to reach downstream agent"));
-            completion.complete(null);
-        }
-    }
-
-    private void relayEvent(
-            ClientEvent event,
-            TaskUpdater updater,
-            CompletableFuture<Void> completion) {
-
-        try {
-            if (event instanceof MessageEvent messageEvent) {
-                String text = extractTextFromMessage(
-                    messageEvent.getMessage());
-                if (text != null) {
-                    updater.updateStatus(TaskState.WORKING, 
-                        agentMessage(text));
-                }
-
-            } else if (event instanceof TaskEvent taskEvent) {
-                Task task = taskEvent.getTask();
-                String text = extractTextFromTask(task);
-                boolean isFinal = task.status() != null
-                    && task.status().state() == TaskState.COMPLETED;
-
-                if (text != null) {
-                    updater.addArtifact(List.of(new TextPart(text)));
-                }
-                if (isFinal) {
-                    updater.complete();
-                    completion.complete(null);
-                }
-
-            } else if (event instanceof TaskUpdateEvent updateEvent) {
-                Task task = updateEvent.getTask();
-                boolean isFinal = updateEvent.isFinal();
-
-                String statusText = null;
-                if (task.status() != null 
-                        && task.status().message() != null) {
-                    statusText = extractTextFromMessage(
-                        task.status().message());
-                }
-
-                if (statusText != null) {
-                    updater.updateStatus(
-                        isFinal ? TaskState.COMPLETED : TaskState.WORKING,
-                        agentMessage(statusText));
-                }
-
-                if (task.artifacts() != null) {
-                    for (var artifact : task.artifacts()) {
-                        if (artifact.parts() != null 
-                                && !artifact.parts().isEmpty()) {
-                            updater.addArtifact(artifact.parts());
-                        }
-                    }
-                }
-
-                if (isFinal) {
-                    updater.complete();
-                    completion.complete(null);
-                }
-            }
-        } catch (Exception e) {
-            LOG.errorf(e, "Error relaying event");
-            completion.complete(null);
-        }
-    }
-
-    // helpers unchanged...
 }
