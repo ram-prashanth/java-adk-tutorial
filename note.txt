@@ -1,292 +1,58 @@
-package com.enterprise.router.executor;
+public class TokenRefreshingMcpToolset extends McpToolset {
 
-import com.enterprise.router.config.RouterConfig;
-import io.a2a.client.A2ACardResolver;
-import io.a2a.client.Client;
-import io.a2a.client.ClientConfig;
-import io.a2a.client.http.JdkA2AHttpClient;
-import io.a2a.client.transport.JSONRPCTransport;
-import io.a2a.client.transport.JSONRPCTransportConfig;
-import io.a2a.server.agentexecution.AgentExecutor;
-import io.a2a.spec.AgentCard;
-import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.inject.Produces;
-import jakarta.inject.Inject;
-import org.jboss.logging.Logger;
+    private static final Logger logger = LoggerFactory.getLogger(TokenRefreshingMcpToolset.class);
 
-import java.util.List;
+    private final AtlanTokenService tokenService;
+    private final String mcpUrl;
+    private final ObjectMapper objectMapper;
+    private volatile String currentToken;
 
-/**
- * CDI producer that wires the routing agent's AgentExecutor.
- *
- * Builds the A2A SDK Client for the data-agent at startup, then
- * produces a {@link RoutingExecutor} that the SDK reference server
- * will call for each inbound request.
- *
- * The SDK reference server auto-discovers this bean and handles:
- *   - POST / endpoint (JSON-RPC + SSE)
- *   - Task lifecycle
- *   - Error formatting
- *   - Streaming
- *
- * All we produce is the executor that does the forwarding work.
- */
-@ApplicationScoped
-public class RoutingExecutorProducer {
-
-    private static final Logger LOG = Logger.getLogger(RoutingExecutorProducer.class);
-
-    @Inject
-    RouterConfig config;
-
-    @Produces
-    public AgentExecutor agentExecutor() {
-        String baseUrl = config.dataAgent().baseUrl();
-        String cardUrl = baseUrl + config.dataAgent().agentCardPath();
-
-        LOG.infof("Building A2A Client for data-agent: %s", baseUrl);
-
-        AgentCard dataAgentCard = new A2ACardResolver(
-            new JdkA2AHttpClient(),
-            baseUrl,
-            cardUrl
-        ).getAgentCard();
-
-        boolean supportsStreaming = dataAgentCard.capabilities() != null
-            && dataAgentCard.capabilities().streaming();
-
-        Client a2aClient = Client.builder(dataAgentCard)
-            .withTransport(JSONRPCTransport.class, new JSONRPCTransportConfig())
-            .clientConfig(
-                new ClientConfig.Builder()
-                    .setStreaming(supportsStreaming)
-                    .setAcceptedOutputModes(List.of("text"))
-                    .build()
-            )
-            .build();
-
-        LOG.infof("A2A Client ready: agent=%s, streaming=%s",
-            dataAgentCard.name(), supportsStreaming);
-
-        return new RoutingExecutor(a2aClient);
-    }
-}
-++++++++++++++
-package com.enterprise.router.executor;
-
-import io.a2a.client.Client;
-import io.a2a.client.ClientEvent;
-import io.a2a.client.MessageEvent;
-import io.a2a.client.TaskUpdateEvent;
-import io.a2a.server.agentexecution.AgentExecutor;
-import io.a2a.server.agentexecution.RequestContext;
-import io.a2a.server.tasks.AgentEmitter;
-import io.a2a.spec.A2A;
-import io.a2a.spec.AgentCard;
-import io.a2a.spec.Artifact;
-import io.a2a.spec.Message;
-import io.a2a.spec.Part;
-import io.a2a.spec.TaskStatusUpdateEvent;
-import io.a2a.spec.TextPart;
-import io.a2a.spec.Task;
-import io.a2a.spec.TaskState;
-import io.a2a.spec.UpdateEvent;
-import org.jboss.logging.Logger;
-
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-import java.util.function.BiConsumer;
-import java.util.function.Consumer;
-
-/**
- * Routing executor — implements {@link AgentExecutor} to forward
- * requests to the data-agent via the A2A SDK Client.
- *
- * The SDK reference server calls {@code execute()} for each inbound
- * JSON-RPC request. This executor:
- *   1. Marks the task as submitted + working
- *   2. Extracts user text from the request context
- *   3. Forwards to the data-agent via A2A SDK Client
- *   4. Relays events back through the AgentEmitter
- *   5. Marks complete or failed
- *
- * Error handling — all errors use emitter.fail():
- *   - Bad input → fail(error message)
- *   - Data-agent unreachable → fail(error message)
- *   - Streaming error → fail(error message)
- *   - Timeout → fail(error message)
- *
- * Threading: execute() blocks until the data-agent finishes or
- * times out. The SDK calls execute() on its worker threads.
- * Configure concurrency via:
- *   quarkus.thread-pool.max-threads=200
- */
-public class RoutingExecutor implements AgentExecutor {
-
-    private static final Logger LOG = Logger.getLogger(RoutingExecutor.class);
-    private static final long TIMEOUT_SECONDS = 300;
-
-    private final Client a2aClient;
-
-    public RoutingExecutor(Client a2aClient) {
-        this.a2aClient = a2aClient;
-        LOG.info("RoutingExecutor initialized");
+    public TokenRefreshingMcpToolset(
+            AtlanTokenService tokenService,
+            String mcpUrl,
+            ObjectMapper objectMapper) {
+        // Initialize parent with current token
+        super(buildParams(mcpUrl, tokenService.getToken()), objectMapper);
+        this.tokenService = tokenService;
+        this.mcpUrl = mcpUrl;
+        this.objectMapper = objectMapper;
+        this.currentToken = tokenService.getToken();
     }
 
     @Override
-    public void execute(RequestContext context, AgentEmitter emitter) throws Exception {
-        // ── Mark task lifecycle ──────────────────────────────────
-        if (context.getTask() == null) {
-            emitter.submit();
+    public Flowable<BaseTool> getTools(ReadonlyContext readonlyContext) {
+        String freshToken = tokenService.getToken();
+
+        // If token changed — close old session and force parent to reinitialize
+        if (!freshToken.equals(currentToken)) {
+            logger.info("[MCP] Token changed — closing stale MCP session");
+            currentToken = freshToken;
+            this.close(); // sets mcpSession = null in parent
+
+            // Rebuild the mcpSessionManager with fresh token by replacing it
+            // McpSessionManager is stored as field in parent — we need to rebuild
+            // the whole toolset via a new McpSessionManager
+            rebuildSessionManager(freshToken);
         }
-        emitter.startWork();
 
-        // ── Extract user text ────────────────────────────────────
-        String userText = extractTextFromMessage(context.getMessage());
-        if (userText == null || userText.isBlank()) {
-            LOG.warn("No text content in request message");
-            emitter.fail(agentMessage("Invalid request: no text content in message."));
-            return;
-        }
+        return super.getTools(readonlyContext);
+    }
 
-        LOG.debugf("Forwarding to data-agent: %d chars", userText.length());
-
-        // ── Forward to data-agent and block until done ───────────
-        CompletableFuture<Void> done = new CompletableFuture<>();
-
-        List<BiConsumer<ClientEvent, AgentCard>> consumers = List.of(
-            (event, card) -> relayEvent(event, emitter, done)
-        );
-
-        Consumer<Throwable> errorHandler = error -> {
-            LOG.errorf(error, "Streaming error from data-agent");
-            try {
-                emitter.fail(agentMessage("Data agent encountered an error. Please try again."));
-            } catch (Exception e) {
-                LOG.errorf(e, "Failed to emit failure status");
-            }
-            done.complete(null);
-        };
-
+    private void rebuildSessionManager(String newToken) {
         try {
-            Message message = A2A.toUserMessage(userText);
-            a2aClient.sendMessage(message, consumers, errorHandler);
+            // McpSessionManager field is private in parent — use reflection to replace it
+            var field = McpToolset.class.getDeclaredField("mcpSessionManager");
+            field.setAccessible(true);
+            field.set(this, new McpSessionManager(buildParams(mcpUrl, newToken)));
         } catch (Exception e) {
-            LOG.errorf(e, "Failed to send message to data-agent");
-            emitter.fail(agentMessage("Unable to reach the data agent. Please try again later."));
-            return;
-        }
-
-        // Block until the final event arrives or we timeout
-        try {
-            done.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (TimeoutException e) {
-            LOG.warn("Timed out waiting for data-agent response");
-            emitter.fail(agentMessage("Request timed out. The data agent did not respond in time."));
-        } catch (Exception e) {
-            LOG.errorf(e, "Unexpected error waiting for data-agent");
-            emitter.fail(agentMessage("An unexpected error occurred. Please try again."));
+            throw new RuntimeException("Failed to rebuild MCP session manager", e);
         }
     }
 
-    @Override
-    public void cancel(RequestContext context, AgentEmitter emitter) throws Exception {
-        emitter.fail(agentMessage("Cancellation is not supported at this time."));
-    }
-
-    // ── Event Relay ─────────────────────────────────────────────
-
-    /**
-     * Relays a typed A2A SDK ClientEvent through the AgentEmitter.
-     *
-     * Client events from the SDK:
-     *   - MessageEvent → contains a Message (direct agent response)
-     *   - TaskUpdateEvent → contains an UpdateEvent which is either:
-     *       - TaskStatusUpdateEvent (status change, has isFinal())
-     *       - TaskArtifactUpdateEvent (artifact added)
-     */
-    private void relayEvent(
-            ClientEvent event,
-            AgentEmitter emitter,
-            CompletableFuture<Void> done) {
-
-        try {
-            if (event instanceof MessageEvent messageEvent) {
-                // Direct message response from data-agent
-                String text = extractTextFromMessage(messageEvent.getMessage());
-                if (text != null) {
-                    emitter.updateStatus(TaskState.WORKING, agentMessage(text));
-                }
-
-            } else if (event instanceof TaskUpdateEvent taskUpdateEvent) {
-                // Task update — unwrap to get the actual update type
-                UpdateEvent updateEvent = taskUpdateEvent.getUpdateEvent();
-                Task task = taskUpdateEvent.getTask();
-
-                if (updateEvent instanceof TaskStatusUpdateEvent statusUpdate) {
-                    // Status change from the data-agent
-                    boolean isFinal = statusUpdate.isFinal();
-
-                    // Relay status message text if present
-                    if (statusUpdate.getStatus() != null
-                            && statusUpdate.getStatus().message() != null) {
-                        String statusText = extractTextFromMessage(
-                            statusUpdate.getStatus().message());
-                        if (statusText != null) {
-                            emitter.updateStatus(
-                                isFinal ? TaskState.COMPLETED : TaskState.WORKING,
-                                agentMessage(statusText));
-                        }
-                    }
-
-                    // Relay any artifacts on the task
-                    if (task != null && task.artifacts() != null) {
-                        for (Artifact artifact : task.artifacts()) {
-                            if (artifact.parts() != null && !artifact.parts().isEmpty()) {
-                                emitter.addArtifact(artifact.parts());
-                            }
-                        }
-                    }
-
-                    if (isFinal) {
-                        emitter.complete();
-                        done.complete(null);
-                    }
-                } else {
-                    // Other update types (e.g., TaskArtifactUpdateEvent)
-                    // Relay artifacts if present on the task
-                    if (task != null && task.artifacts() != null) {
-                        for (Artifact artifact : task.artifacts()) {
-                            if (artifact.parts() != null && !artifact.parts().isEmpty()) {
-                                emitter.addArtifact(artifact.parts());
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception e) {
-            LOG.errorf(e, "Error relaying event");
-            done.complete(null);
-        }
-    }
-
-    // ── Helpers ──────────────────────────────────────────────────
-
-    private String extractTextFromMessage(Message message) {
-        if (message == null || message.parts() == null) return null;
-        return message.parts().stream()
-            .filter(p -> p instanceof TextPart)
-            .map(p -> ((TextPart) p).text())
-            .findFirst()
-            .orElse(null);
-    }
-
-    private Message agentMessage(String text) {
-        return new Message.Builder()
-            .role(Message.Role.AGENT)
-            .parts(List.of(new TextPart(text)))
+    private static StreamableHttpServerParameters buildParams(String url, String token) {
+        return StreamableHttpServerParameters.builder()
+            .url(url)
+            .headers(Map.of("Authorization", "Bearer " + token))
             .build();
     }
 }
