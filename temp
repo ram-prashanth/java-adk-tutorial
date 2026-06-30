@@ -1,0 +1,7 @@
+private Session inject(Session session, String userId) {
+  Map<String, String> headers = resolveHeadersFor(userId); // your lookup from contextId/user
+  if (!headers.isEmpty()) {
+    session.state().put("temp:auth_headers", new HashMap<>(headers));
+  }
+  return session;
+}
