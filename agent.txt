@@ -1,0 +1,42 @@
+package com.cme.udap.agents.data.callbacks;
+
+import com.google.adk.agents.Callbacks;
+import com.google.adk.agents.CallbackContext;
+import com.google.adk.models.LlmResponse;
+import com.google.genai.types.Content;
+import com.google.genai.types.Part;
+import io.reactivex.rxjava3.core.Maybe;
+import jakarta.enterprise.context.ApplicationScoped;
+import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+@ApplicationScoped
+public class ModelCallbackHandler implements Callbacks.AfterModelCallback {
+
+    private static final Logger logger = LoggerFactory.getLogger(ModelCallbackHandler.class);
+    private static final String FALLBACK_TEXT = "No response was generated.";
+
+    @Override
+    public Maybe<LlmResponse> call(CallbackContext ctx, LlmResponse res) {
+        boolean hasParts = res.content()
+            .flatMap(Content::parts)
+            .map(parts -> !parts.isEmpty())
+            .orElse(false);
+
+        if (hasParts) {
+            return Maybe.empty();               // leave normal / function-call turns untouched
+        }
+
+        logger.warn("Empty model response (finishReason={}); substituting fallback part",
+            res.finishReason().map(Object::toString).orElse("unknown"));
+
+        LlmResponse fallback = LlmResponse.builder()
+            .content(Content.builder()
+                .role("model")
+                .parts(List.of(Part.fromText(FALLBACK_TEXT)))
+                .build())
+            .build();
+        return Maybe.just(fallback);
+    }
+}
