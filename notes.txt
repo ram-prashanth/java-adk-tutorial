@@ -1,82 +1,29 @@
-package your.package.sessions;
+import asyncio
+from uuid import uuid4
 
-import com.google.adk.events.Event;
-import com.google.adk.sessions.BaseSessionService;
-import com.google.adk.sessions.GetSessionConfig;
-import com.google.adk.sessions.InMemorySessionService;
-import com.google.adk.sessions.ListEventsResponse;
-import com.google.adk.sessions.ListSessionsResponse;
-import com.google.adk.sessions.Session;
-import io.reactivex.rxjava3.core.Completable;
-import io.reactivex.rxjava3.core.Maybe;
-import io.reactivex.rxjava3.core.Single;
-import jakarta.enterprise.context.ApplicationScoped;
-import java.util.Map;
-import java.util.Optional;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import httpx
+from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
+from a2a.types import Message, Part, Role, TextPart
 
-@ApplicationScoped
-public class A2ASessionService implements BaseSessionService {
+BASE_URL = "http://localhost:8080"
 
-    private static final Logger logger = LoggerFactory.getLogger(A2ASessionService.class);
-    private static final String A2A_USER_PREFIX = "A2A_USER_";
+async def main():
+    async with httpx.AsyncClient(timeout=60) as http:
+        card = await A2ACardResolver(httpx_client=http, base_url=BASE_URL).get_agent_card()
+        print("connected to:", card.name)
 
-    private final InMemorySessionService delegate = new InMemorySessionService();
+        client = ClientFactory(ClientConfig(httpx_client=http, streaming=False)).create(card)
 
-    @Override
-    public Single<Session> createSession(String appName, String userId) {
-        // AgentExecutor always calls this two-arg version — intercept and fix
-        // userId is always "A2A_USER_<contextId>" so extract contextId as sessionId
-        String sessionId = userId.startsWith(A2A_USER_PREFIX)
-            ? userId.substring(A2A_USER_PREFIX.length())
-            : userId;
+        msg = Message(
+            message_id=uuid4().hex,
+            role=Role.user,
+            parts=[Part(root=TextPart(text="Hello from Python"))],
+        )
+        async for event in client.send_message(msg):
+            print(event)
 
-        logger.info("[SESSION] createSession intercepted — userId: {}, resolved sessionId: {}",
-            userId, sessionId);
+asyncio.run(main())
 
-        return delegate.createSession(appName, userId, null, sessionId);
-    }
 
-    @Override
-    public Single<Session> createSession(
-            String appName, String userId,
-            Map<String, Object> state, String sessionId) {
-        return delegate.createSession(appName, userId, state, sessionId);
-    }
 
-    @Override
-    public Maybe<Session> getSession(
-            String appName, String userId,
-            String sessionId, Optional<GetSessionConfig> config) {
-        logger.info("[SESSION] getSession — userId: {}, sessionId: {}, instance: {}",
-            userId, sessionId, System.identityHashCode(this));
-        return delegate.getSession(appName, userId, sessionId, config)
-            .doOnSuccess(s -> logger.info("[SESSION] HIT — eventCount: {}", s.events().size()))
-            .doOnComplete(() -> logger.warn("[SESSION] MISS — userId: {}, sessionId: {}",
-                userId, sessionId));
-    }
-
-    @Override
-    public Single<Event> appendEvent(Session session, Event event) {
-        logger.info("[SESSION] appendEvent — sessionId: {}, author: {}",
-            session.id(), event.author());
-        return delegate.appendEvent(session, event);
-    }
-
-    @Override
-    public Completable deleteSession(String appName, String userId, String sessionId) {
-        return delegate.deleteSession(appName, userId, sessionId);
-    }
-
-    @Override
-    public Single<ListSessionsResponse> listSessions(String appName, String userId) {
-        return delegate.listSessions(appName, userId);
-    }
-
-    @Override
-    public Single<ListEventsResponse> listEvents(
-            String appName, String userId, String sessionId) {
-        return delegate.listEvents(appName, userId, sessionId);
-    }
-}
+pip install a2a-sdk httpx
